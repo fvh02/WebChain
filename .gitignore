@@ -1,0 +1,6 @@
+*.db
+*.db-wal
+*.db-shm
+denylist.txt
+__pycache__/
+.env*

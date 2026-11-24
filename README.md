@@ -28,6 +28,16 @@ ipfs pin remote add --service=webchain --name=meine-seite <CID>
 | `WEBCHAIN_MAX_PINS` | `1000` | Pins pro Konto |
 | `WEBCHAIN_DELEGATES` | leer | Multiaddrs des Knotens, kommagetrennt |
 
+## Kundenseite `/account`
+
+Kunden melden sich mit ihrem API-Token an. Die Seite selbst läuft klassisch über diesen Server, nicht über IPFS. Sie dient nur dazu, Webseiten nach IPFS zu bringen:
+
+- **Webseite hochladen**: Ordner als ZIP. Ein einzelner Oberordner in der ZIP wird entfernt, sodass `index.html` an der Wurzel liegt. Der Server fügt die Dateien per Kubo-RPC (`/api/v0/add`) als ein Verzeichnis ein und pinnt dessen CID.
+- **Vorhandene CID pinnen** und **eigene Pins löschen**.
+- Pins mit Status `pinned` haben einen Link zum Gateway (`WEBCHAIN_GATEWAY`, Standard `https://dweb.link`).
+
+Limits: `WEBCHAIN_MAX_UPLOAD_MB` (Standard 50) für die ZIP, entpackt höchstens das Vierfache und 10 000 Dateien.
+
 ## Meldungen und Admin-Seite
 
 - **`/report`**: öffentliches Formular für Meldungen rechtswidriger Inhalte (Art. 16 DSA). Höchstens 10 Meldungen pro IP und Stunde. Die IP wird nur im Arbeitsspeicher gezählt, nicht gespeichert.

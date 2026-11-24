@@ -8,12 +8,16 @@ Usage:
   python3 webchain.py add-admin <name>   create an admin, print its login token
   python3 webchain.py block <cid>        takedown: deny-list, unpin, fail all requests
 
-Web pages: /admin (search pins, handle reports, remove content), /report (public notice form).
+Web pages: /account (users: upload a website ZIP, manage pins), /admin (search pins, handle
+reports, remove content), /report (public notice form). They are served by this server, not via IPFS.
 """
 import contextlib
 import datetime
+import email.parser
+import email.policy
 import hashlib
 import html
+import io
 import json
 import os
 import re
@@ -25,6 +29,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DB = os.environ.get("WEBCHAIN_DB", "webchain.db")
@@ -36,6 +41,10 @@ MAX_PINS = int(os.environ.get("WEBCHAIN_MAX_PINS", "1000"))
 DELEGATES = [d for d in os.environ.get("WEBCHAIN_DELEGATES", "").split(",") if d]
 MAX_BODY = 64 * 1024
 SESSION_TTL = 8 * 3600
+MAX_UPLOAD = int(os.environ.get("WEBCHAIN_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_UNZIPPED = 4 * MAX_UPLOAD
+MAX_FILES = 10000
+GATEWAY = os.environ.get("WEBCHAIN_GATEWAY", "https://dweb.link").rstrip("/")
 
 # CIDv0 (base58 "Qm...") or CIDv1 in base32 ("b...") - the forms Kubo prints.
 CID_RE = re.compile(r"^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})$")
@@ -74,6 +83,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS reports (
           id INTEGER PRIMARY KEY, cid TEXT NOT NULL, reason TEXT NOT NULL, contact TEXT,
           status TEXT NOT NULL DEFAULT 'open', created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS user_sessions (
+          id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS reports_cid ON reports(cid, status);
         """)
 
@@ -127,6 +138,64 @@ def unpin_if_unused(cid):
             kubo("pin/rm", cid)
         except Exception:
             pass  # not pinned (yet) or already removed
+
+
+def delete_pin(con, user_id, requestid):
+    """Delete a user's own pin request; True if it existed. Unpins once no one else needs the CID."""
+    row = con.execute("SELECT cid FROM pins WHERE requestid=? AND user_id=?",
+                      (requestid, user_id)).fetchone()
+    if not row:
+        return False
+    con.execute("DELETE FROM pins WHERE requestid=?", (requestid,))
+    con.commit()
+    unpin_if_unused(row["cid"])
+    return True
+
+
+def zip_to_kubo(data):
+    """Add a website ZIP to Kubo as one directory; return the root CID (not pinned yet)."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        files = [i for i in zf.infolist() if not i.is_dir()]
+    except zipfile.BadZipFile:
+        raise ApiError(400, "BAD_REQUEST", "Keine gültige ZIP-Datei.")
+    if not files:
+        raise ApiError(400, "BAD_REQUEST", "Die ZIP-Datei ist leer.")
+    if len(files) > MAX_FILES or sum(i.file_size for i in files) > MAX_UNZIPPED:
+        raise ApiError(413, "BAD_REQUEST", "Die ZIP-Datei ist entpackt zu groß.")
+    names = [i.filename for i in files]
+    for n in names:
+        if n.startswith("/") or "\\" in n or any(seg in ("", ".", "..") for seg in n.split("/")):
+            raise ApiError(400, "BAD_REQUEST", "Ungültiger Dateipfad in der ZIP-Datei.")
+    # A zipped folder "meine-seite/..." should serve its contents at the root.
+    tops = {n.split("/")[0] for n in names}
+    strip = len(tops) == 1 and all("/" in n for n in names)
+    boundary = secrets.token_hex(16)
+    parts, dirs = [], set()
+
+    def part(path, ctype, content=b""):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+                     f'filename="{urllib.parse.quote_plus(path, safe="")}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n".encode() + content + b"\r\n")
+
+    part("site", "application/x-directory")
+    for info in sorted(files, key=lambda i: i.filename):
+        rel = info.filename.split("/", 1)[1] if strip else info.filename
+        segs = rel.split("/")
+        for k in range(1, len(segs)):  # parent directories must come before their files
+            d = "/".join(segs[:k])
+            if d not in dirs:
+                dirs.add(d)
+                part("site/" + d, "application/x-directory")
+        part("site/" + rel, "application/octet-stream", zf.read(info))
+    # shortcut: whole request is built in memory (bounded by MAX_UNZIPPED); stream it if limits grow.
+    body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(f"{KUBO}/api/v0/add?cid-version=1&pin=false&quieter=true",
+                                 data=body, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        lines = [ln for ln in r.read().decode().splitlines() if ln.strip()]
+    return json.loads(lines[-1])["Hash"]
 
 
 def iso(ts):
@@ -259,10 +328,8 @@ class Handler(BaseHTTPRequestHandler):
                     unpin_if_unused(old["cid"])
                 return self.send_json(202, pin_status(self.own_pin(con, uid, requestid)))
             if len(parts) == 2 and method == "DELETE":
-                old = self.own_pin(con, uid, parts[1])
-                con.execute("DELETE FROM pins WHERE requestid=?", (old["requestid"],))
-                con.commit()
-                unpin_if_unused(old["cid"])
+                if not delete_pin(con, uid, parts[1]):
+                    raise ApiError(404, "NOT_FOUND", "pin request not found")
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 return self.end_headers()
@@ -309,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")  # no-referrer makes browsers send "Origin: null"
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
                          "frame-ancestors 'none'; base-uri 'none'")
@@ -386,6 +453,81 @@ class Handler(BaseHTTPRequestHandler):
                     return self.redirect("/admin")
         self.send_html(404, "Nicht gefunden", "<p>Seite nicht gefunden.</p>")
 
+    def session_user(self, con):
+        cookie = self.headers.get("Cookie", "")
+        sid = next((c.split("=", 1)[1] for c in cookie.split("; ") if c.startswith("wc_user=")), "")
+        if not sid:
+            return None
+        con.execute("DELETE FROM user_sessions WHERE expires<?", (time.time(),))
+        row = con.execute("SELECT user_id FROM user_sessions WHERE id_hash=?", (token_hash(sid),)).fetchone()
+        return row["user_id"] if row else None
+
+    def upload_fields(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_UPLOAD:
+            raise ApiError(413, "BAD_REQUEST", f"Datei zu groß (max. {MAX_UPLOAD // 2**20} MB).")
+        head = f"Content-Type: {self.headers.get('Content-Type', '')}\r\n\r\n".encode()
+        msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(head + self.rfile.read(length))
+        if not msg.is_multipart():
+            raise ApiError(400, "BAD_REQUEST", "Ungültiger Upload.")
+        return {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
+                for p in msg.iter_parts()}
+
+    def handle_account(self, method, path, query):
+        if method == "POST" and not self.same_origin():
+            return self.send_html(403, "Fehler", "<p>Ungültige Herkunft.</p>")
+        cookie_attrs = "Path=/account; HttpOnly; Secure; SameSite=Strict"
+        with db() as con:
+            if path == "/account/login" and method == "POST":
+                row = con.execute("SELECT id FROM users WHERE token_hash=?",
+                                  (token_hash(self.form().get("token", "").strip()),)).fetchone()
+                if not row:
+                    return self.send_html(401, "Anmeldung", USER_LOGIN_FORM.format(msg="Falscher Token."))
+                sid = secrets.token_urlsafe(32)
+                con.execute("INSERT INTO user_sessions VALUES (?,?,?)",
+                            (token_hash(sid), row["id"], time.time() + SESSION_TTL))
+                return self.redirect("/account", [("Set-Cookie",
+                    f"wc_user={sid}; {cookie_attrs}; Max-Age={SESSION_TTL}")])
+            uid = self.session_user(con)
+            if not uid:
+                if method == "POST":
+                    return self.redirect("/account")
+                return self.send_html(200, "Anmeldung", USER_LOGIN_FORM.format(msg=""))
+            if path == "/account" and method == "GET":
+                return self.send_html(200, "Meine Webseiten", account_page(con, uid, query))
+            if method != "POST":
+                return self.send_html(404, "Nicht gefunden", "<p>Seite nicht gefunden.</p>")
+            try:
+                if path == "/account/upload":
+                    f = self.upload_fields()
+                    name = (f.get("name") or b"").decode("utf-8", "replace").strip() or None
+                    if not f.get("site"):
+                        raise ApiError(400, "BAD_REQUEST", "Bitte eine ZIP-Datei auswählen.")
+                    cid = zip_to_kubo(f["site"])
+                    requestid, cid = create_pin(con, uid, {"cid": cid, "name": name})
+                    con.commit()
+                    start_pin(requestid, cid)
+                    return self.redirect("/account?" + urllib.parse.urlencode(
+                        {"msg": f"Hochgeladen. CID: {cid}"}))
+                f = self.form()
+                if path == "/account/logout":
+                    con.execute("DELETE FROM user_sessions WHERE user_id=?", (uid,))
+                    return self.redirect("/account", [("Set-Cookie", f"wc_user=; {cookie_attrs}; Max-Age=0")])
+                if path == "/account/pin":
+                    requestid, cid = create_pin(con, uid, {"cid": f.get("cid", "").strip(),
+                                                           "name": f.get("name", "").strip() or None})
+                    con.commit()
+                    start_pin(requestid, cid)
+                    return self.redirect("/account?msg=Pin+angelegt.")
+                if path == "/account/delete":
+                    delete_pin(con, uid, f.get("requestid", ""))
+                    return self.redirect("/account?msg=Gel%C3%B6scht.")
+            except ApiError as e:
+                return self.redirect("/account?" + urllib.parse.urlencode({"msg": e.details}))
+            except (OSError, ValueError, KeyError):
+                return self.redirect("/account?msg=IPFS-Knoten+nicht+erreichbar.")
+        self.send_html(404, "Nicht gefunden", "<p>Seite nicht gefunden.</p>")
+
     def report_page(self, method):
         if method == "GET":
             return self.send_html(200, "Inhalt melden", REPORT_FORM.format(msg=""))
@@ -408,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, method):
         try:
             url = urllib.parse.urlsplit(self.path)
+            if url.path == "/account" or url.path.startswith("/account/"):
+                return self.handle_account(method, url.path, url.query)
             if url.path == "/report" or url.path == "/admin" or url.path.startswith("/admin/"):
                 return self.handle_web(method, url.path, url.query)
             self.handle_api(method)
@@ -533,6 +677,43 @@ def admin_page(con, admin, query):
         out.append("</table>")
     return "".join(out)
 
+
+def account_page(con, uid, query):
+    e = html.escape
+    msg = dict(urllib.parse.parse_qsl(query)).get("msg", "")[:300]
+    name = con.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()["name"]
+    out = [f'<p role="status">{e(msg)}</p>' if msg else "",
+           f'<p>Angemeldet als <b>{e(name)}</b></p>'
+           '<form method="post" action="/account/logout"><button>Abmelden</button></form>'
+           '<h2>Webseite hochladen</h2>'
+           '<p>Packe den Ordner deiner Webseite als ZIP. Er muss eine <code>index.html</code> enthalten '
+           'und relative Pfade nutzen (<code>./style.css</code>, nicht <code>/style.css</code>).</p>'
+           '<form method="post" action="/account/upload" enctype="multipart/form-data">'
+           '<p><label>ZIP-Datei<br><input type="file" name="site" accept=".zip,application/zip" required></label></p>'
+           '<p><label>Name (optional)<br><input name="name" maxlength="255"></label></p>'
+           f'<p><button>Hochladen</button> (max. {MAX_UPLOAD // 2**20} MB)</p></form>'
+           '<h2>Vorhandene CID pinnen</h2><form method="post" action="/account/pin">'
+           '<label>CID <input name="cid" required size="60"></label> '
+           '<label>Name <input name="name" maxlength="255"></label> <button>Pinnen</button></form>']
+    rows = con.execute("SELECT * FROM pins WHERE user_id=? ORDER BY created DESC LIMIT 200", (uid,)).fetchall()
+    out.append(f"<h2>Meine Pins ({len(rows)})</h2>")
+    if rows:
+        out.append("<table><tr><th>Name</th><th>CID</th><th>Status</th><th>Erstellt</th><th></th></tr>")
+        for r in rows:
+            link = (f'<a href="{e(GATEWAY)}/ipfs/{e(r["cid"])}/" target="_blank" rel="noopener noreferrer">Öffnen</a>'
+                    if r["status"] == "pinned" else "")
+            out.append(f'<tr><td>{e(r["name"] or "")}</td><td><code>{e(r["cid"])}</code></td>'
+                       f'<td>{e(r["status"])}</td><td>{iso(r["created"])[:16]}</td><td>{link} '
+                       '<form method="post" action="/account/delete">'
+                       f'<input type="hidden" name="requestid" value="{e(r["requestid"])}">'
+                       '<button>Löschen</button></form></td></tr>')
+        out.append("</table><p>Status <code>queued</code>/<code>pinning</code>? Seite neu laden.</p>")
+    return "".join(out)
+
+
+USER_LOGIN_FORM = """<p>{msg}</p><form method="post" action="/account/login">
+<label>API-Token <input type="password" name="token" required autocomplete="current-password"></label>
+<button>Anmelden</button></form>"""
 
 PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} - WebChain</title>

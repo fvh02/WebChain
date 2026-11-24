@@ -1,10 +1,14 @@
 """End-to-end test against a fake Kubo RPC. Run: python3 -m unittest -v"""
+import io
 import json
+import re
 import os
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +21,8 @@ os.environ["WEBCHAIN_MAX_PINS"] = "3"
 
 KUBO_PINS = set()
 KUBO_FAIL = set()
+KUBO_ADDS = []
+ADD_CID = "bafybeicuvnjaygzunfrxfsrfp7ld3c6w3hhd6wkt4cpvzvxyubmcydhsle"
 
 
 class FakeKubo(BaseHTTPRequestHandler):
@@ -24,6 +30,14 @@ class FakeKubo(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        if self.path.startswith("/api/v0/add"):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            KUBO_ADDS.append(re.findall(rb'filename="([^"]+)"\r\nContent-Type: ([^\r]+)', body))
+            out = json.dumps({"Name": "site", "Hash": ADD_CID}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            return self.wfile.write(out)
         cmd, _, arg = self.path.partition("?arg=")
         if cmd.endswith("pin/add") and arg not in KUBO_FAIL:
             KUBO_PINS.add(arg)
@@ -171,7 +185,7 @@ class AdminWebTest(unittest.TestCase):
         cls.admin_token = "admin-tok"
         with webchain.db() as con:
             con.execute("INSERT OR IGNORE INTO users (name, token_hash) VALUES ('carol', 'x')")
-            con.execute("INSERT INTO admins VALUES (?,?)", (webchain.token_hash(cls.admin_token), "root"))
+            con.execute("INSERT OR IGNORE INTO admins VALUES (?,?)", (webchain.token_hash(cls.admin_token), "root"))
 
     def req(self, method, path, form=None, cookie=None, origin=None):
         data = urllib.parse.urlencode(form).encode() if form is not None else None
@@ -244,3 +258,87 @@ class AdminWebTest(unittest.TestCase):
     def call_status(self, cid):
         with webchain.db() as con:
             return con.execute("SELECT status FROM pins WHERE cid=?", (cid,)).fetchone()[0]
+
+
+class AccountWebTest(AdminWebTest):
+    """User portal: login with API token, upload ZIP, pin by CID, delete."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user_token = "dave-tok"
+        with webchain.db() as con:
+            con.execute("INSERT INTO users (name, token_hash) VALUES ('dave', ?)",
+                        (webchain.token_hash(cls.user_token),))
+
+    def upload(self, cookie, filename, data, name="meine-seite"):
+        b = uuid.uuid4().hex
+        body = (f'--{b}\r\nContent-Disposition: form-data; name="name"\r\n\r\n{name}\r\n'
+                f'--{b}\r\nContent-Disposition: form-data; name="site"; filename="{filename}"\r\n'
+                f'Content-Type: application/zip\r\n\r\n').encode() + data + f"\r\n--{b}--\r\n".encode()
+        r = urllib.request.Request(self.base + "/account/upload", data=body, method="POST",
+                                   headers={"Content-Type": f"multipart/form-data; boundary={b}",
+                                            "Cookie": cookie})
+        try:
+            with OPENER.open(r) as resp:
+                return resp.status, resp.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    def test_report_search_remove_reject(self):
+        pass  # covered by AdminWebTest
+
+    def test_account(self):
+        self.assertIn('action="/account/login"', self.req("GET", "/account")[2])
+        self.assertEqual(self.req("POST", "/account/login", {"token": "admin-tok"})[0], 401)
+        code, h, _ = self.req("POST", "/account/login", {"token": self.user_token})
+        self.assertEqual(code, 303)
+        cookie = h["Set-Cookie"].split(";")[0]
+        self.assertIn("Path=/account", h["Set-Cookie"])
+
+        # ZIP of a folder: top folder stripped, parent dirs sent before files
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("meine-seite/index.html", "<h1>Hallo</h1>")
+            z.writestr("meine-seite/css/style.css", "h1{}")
+        code, h = self.upload(cookie, "seite.zip", buf.getvalue())
+        self.assertEqual(code, 303)
+        self.assertIn(ADD_CID, urllib.parse.unquote_plus(h["Location"]))
+        self.assertEqual([n for n, _ in KUBO_ADDS[-1]], [b"site", b"site%2Fcss", b"site%2Fcss%2Fstyle.css",
+                                                          b"site%2Findex.html"])
+        self.assertEqual(KUBO_ADDS[-1][0][1], b"application/x-directory")
+        for _ in range(100):
+            if ADD_CID in KUBO_PINS:
+                break
+            time.sleep(0.02)
+        self.assertIn(ADD_CID, KUBO_PINS)
+        page = self.req("GET", "/account", cookie=cookie)[2]
+        self.assertIn("meine-seite", page)
+        self.assertIn(f"https://dweb.link/ipfs/{ADD_CID}/", page)
+
+        # bad uploads
+        bad = io.BytesIO()
+        with zipfile.ZipFile(bad, "w") as z:
+            z.writestr("../evil.html", "x")
+        for data in (b"not a zip", bad.getvalue()):
+            code, h = self.upload(cookie, "x.zip", data)
+            self.assertEqual(code, 303)
+            self.assertNotIn("Hochgeladen", urllib.parse.unquote_plus(h["Location"]))
+
+        # cross-site upload rejected
+        self.assertEqual(self.req("POST", "/account/pin", {"cid": CID3}, cookie, "https://evil.example")[0], 403)
+
+        # admin cookie path does not grant account access and vice versa
+        self.assertIn('action="/admin/login"', self.req("GET", "/admin", cookie=cookie)[2])
+
+        # delete own pin; another user's requestid is ignored
+        with webchain.db() as con:
+            rid = con.execute("SELECT requestid FROM pins WHERE cid=?", (ADD_CID,)).fetchone()[0]
+            foreign = con.execute("SELECT requestid FROM pins WHERE user_id!=(SELECT id FROM users WHERE name='dave')"
+                                  " AND status!='failed' LIMIT 1").fetchone()
+        if foreign:
+            self.req("POST", "/account/delete", {"requestid": foreign[0]}, cookie)
+            with webchain.db() as con:
+                self.assertIsNotNone(con.execute("SELECT 1 FROM pins WHERE requestid=?", (foreign[0],)).fetchone())
+        self.assertEqual(self.req("POST", "/account/delete", {"requestid": rid}, cookie)[0], 303)
+        self.assertNotIn(ADD_CID, KUBO_PINS)

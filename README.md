@@ -28,13 +28,24 @@ ipfs pin remote add --service=webchain --name=meine-seite <CID>
 | `WEBCHAIN_MAX_PINS` | `1000` | Pins pro Konto |
 | `WEBCHAIN_DELEGATES` | leer | Multiaddrs des Knotens, kommagetrennt |
 
-## Takedown (Meldung nach DSA)
+## Meldungen und Admin-Seite
+
+- **`/report`**: öffentliches Formular für Meldungen rechtswidriger Inhalte (Art. 16 DSA). Höchstens 10 Meldungen pro IP und Stunde. Die IP wird nur im Arbeitsspeicher gezählt, nicht gespeichert.
+- **`/admin`**: Suche nach CID, Pin-Name oder Kontoname. Gemeldete Treffer sind rot markiert. Darunter stehen alle offenen Meldungen mit den Knöpfen „Entfernen“ und „Ablehnen“.
+
+Admin anlegen:
+
+```bash
+python3 webchain.py add-admin root           # gibt den Login-Token einmalig aus
+```
+
+„Entfernen“ setzt die CID auf die Sperrliste, entfernt den Pin aus Kubo, markiert alle Anfragen dafür als `failed` und schließt die Meldungen. Neue Pins der CID werden mit `403 CONTENT_BLOCKED` abgelehnt. Dasselbe geht per Kommandozeile:
 
 ```bash
 python3 webchain.py block <CID>
 ```
 
-Setzt die CID auf die Sperrliste, entfernt den Pin aus Kubo und markiert alle Anfragen dafür als `failed`. Neue Pins der CID werden mit `403 CONTENT_BLOCKED` abgelehnt.
+Die Admin-Anmeldung setzt ein Session-Cookie mit `Secure`. Es funktioniert deshalb nur über HTTPS oder `http://localhost`.
 
 ## Betrieb
 

@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -148,3 +149,98 @@ class WebChainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+class AdminWebTest(unittest.TestCase):
+    base = None
+
+    @classmethod
+    def setUpClass(cls):
+        webchain.init_db()
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), webchain.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        cls.admin_token = "admin-tok"
+        with webchain.db() as con:
+            con.execute("INSERT OR IGNORE INTO users (name, token_hash) VALUES ('carol', 'x')")
+            con.execute("INSERT INTO admins VALUES (?,?)", (webchain.token_hash(cls.admin_token), "root"))
+
+    def req(self, method, path, form=None, cookie=None, origin=None):
+        data = urllib.parse.urlencode(form).encode() if form is not None else None
+        r = urllib.request.Request(self.base + path, data=data, method=method)
+        if cookie:
+            r.add_header("Cookie", cookie)
+        if origin:
+            r.add_header("Origin", origin)
+        try:
+            with OPENER.open(r) as resp:
+                return resp.status, resp.headers, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode()
+
+    def login(self):
+        code, h, _ = self.req("POST", "/admin/login", {"token": self.admin_token})
+        self.assertEqual(code, 303)
+        return h["Set-Cookie"].split(";")[0]
+
+    def test_report_search_remove_reject(self):
+        cid_a = "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+        cid_b = "bafybeie5gq4jxvzmsym6hjlwxej4rwdoxt7wadqvmmwbqi7r27fclha2va"
+        with webchain.db() as con:
+            uid = con.execute("SELECT id FROM users WHERE name='carol'").fetchone()[0]
+            for cid, name in ((cid_a, "<script>x</script>"), (cid_b, "harmlos")):
+                con.execute("INSERT INTO pins VALUES (?,?,?,?,'[]','{}','pinned',?)",
+                            (cid + "-r", uid, cid, name, time.time()))
+        KUBO_PINS.update({cid_a, cid_b})
+
+        # public report form
+        self.assertEqual(self.req("POST", "/report", {"cid": "nope", "reason": "x"})[0], 400)
+        for cid in (cid_a, cid_b):
+            self.assertEqual(self.req("POST", "/report", {"cid": cid, "reason": "rechtswidriger Inhalt"})[0], 200)
+
+        # admin pages need login
+        code, _, body = self.req("GET", "/admin")
+        self.assertIn('name="token"', body)
+        self.assertEqual(self.req("POST", "/admin/remove", {"cid": cid_a})[0], 303)
+        self.assertIn(cid_a, KUBO_PINS)
+        self.assertEqual(self.req("POST", "/admin/login", {"token": "wrong"})[0], 401)
+
+        cookie = self.login()
+        code, _, body = self.req("GET", "/admin?q=carol", cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertIn("Offene Meldungen (2)", body)
+        self.assertIn("&lt;script&gt;", body)
+        self.assertNotIn("<script>x", body)
+
+        # cross-site POST rejected
+        code, _, _ = self.req("POST", "/admin/remove", {"cid": cid_a}, cookie, origin="https://evil.example")
+        self.assertEqual(code, 403)
+        self.assertIn(cid_a, KUBO_PINS)
+
+        # remove reported content
+        self.assertEqual(self.req("POST", "/admin/remove", {"cid": cid_a}, cookie)[0], 303)
+        self.assertNotIn(cid_a, KUBO_PINS)
+        self.assertEqual(self.call_status(cid_a), "failed")
+
+        # reject the other report: content stays
+        with webchain.db() as con:
+            rid = con.execute("SELECT id FROM reports WHERE cid=?", (cid_b,)).fetchone()[0]
+        self.assertEqual(self.req("POST", "/admin/reject", {"id": rid}, cookie)[0], 303)
+        self.assertIn(cid_b, KUBO_PINS)
+        self.assertIn("Offene Meldungen (0)", self.req("GET", "/admin", cookie=cookie)[2])
+
+        # logout kills the session
+        self.req("POST", "/admin/logout", {}, cookie)
+        self.assertIn('name="token"', self.req("GET", "/admin", cookie=cookie)[2])
+
+    def call_status(self, cid):
+        with webchain.db() as con:
+            return con.execute("SELECT status FROM pins WHERE cid=?", (cid,)).fetchone()[0]

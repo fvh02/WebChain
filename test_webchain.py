@@ -1,8 +1,10 @@
 """End-to-end test against a fake Kubo RPC. Run: python3 -m unittest -v"""
+import contextlib
 import io
 import json
 import re
 import os
+import pathlib
 import tempfile
 import threading
 import time
@@ -342,3 +344,52 @@ class AccountWebTest(AdminWebTest):
                 self.assertIsNotNone(con.execute("SELECT 1 FROM pins WHERE requestid=?", (foreign[0],)).fetchone())
         self.assertEqual(self.req("POST", "/account/delete", {"requestid": rid}, cookie)[0], 303)
         self.assertNotIn(ADD_CID, KUBO_PINS)
+
+
+class KeyFileLoginTest(AdminWebTest):
+    """Login with a key file (as stored on a USB stick) for users and admins."""
+
+    def test_report_search_remove_reject(self):
+        pass  # covered by AdminWebTest
+
+    def post_keyfile(self, path, content):
+        b = uuid.uuid4().hex
+        body = (f'--{b}\r\nContent-Disposition: form-data; name="token"\r\n\r\n\r\n'
+                f'--{b}\r\nContent-Disposition: form-data; name="keyfile"; filename="webchain.key"\r\n'
+                f'Content-Type: application/octet-stream\r\n\r\n').encode() + content + f"\r\n--{b}--\r\n".encode()
+        r = urllib.request.Request(self.base + path, data=body, method="POST",
+                                   headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        try:
+            with OPENER.open(r) as resp:
+                return resp.status, resp.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    def test_keyfile_login(self):
+        stick = tempfile.mkdtemp()
+        with contextlib.redirect_stdout(io.StringIO()):
+            webchain.add_user("erin", os.path.join(stick, "user.key"))
+            webchain.add_admin("boss", os.path.join(stick, "admin.key"))
+        with self.assertRaises(FileExistsError):  # never overwrites an existing key
+            webchain.add_user("erin2", os.path.join(stick, "user.key"))
+        self.assertEqual(os.stat(os.path.join(stick, "user.key")).st_mode & 0o777, 0o600)
+        user_key = pathlib.Path(stick, "user.key").read_bytes()
+        admin_key = pathlib.Path(stick, "admin.key").read_bytes()
+
+        code, h = self.post_keyfile("/account/login", user_key)
+        self.assertEqual(code, 303)
+        self.assertIn("Angemeldet als <b>erin</b>",
+                      self.req("GET", "/account", cookie=h["Set-Cookie"].split(";")[0])[2])
+        code, h = self.post_keyfile("/admin/login", admin_key)
+        self.assertEqual(code, 303)
+        self.assertIn("Angemeldet als <b>boss</b>",
+                      self.req("GET", "/admin", cookie=h["Set-Cookie"].split(";")[0])[2])
+
+        self.assertEqual(self.post_keyfile("/admin/login", user_key)[0], 401)  # user key is no admin key
+        self.assertEqual(self.post_keyfile("/account/login", b"falsch")[0], 401)
+        self.assertEqual(self.post_keyfile("/account/login", b"x" * 70000)[0], 413)
+        # the key file doubles as API token
+        req = urllib.request.Request(self.base + "/pins",
+                                     headers={"Authorization": "Bearer " + user_key.decode().strip()})
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 200)

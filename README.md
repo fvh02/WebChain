@@ -28,6 +28,19 @@ ipfs pin remote add --service=webchain --name=meine-seite <CID>
 | `WEBCHAIN_MAX_PINS` | `1000` | Pins pro Konto |
 | `WEBCHAIN_DELEGATES` | leer | Multiaddrs des Knotens, kommagetrennt |
 
+## Login per USB-Stick
+
+Statt den Token einzutippen, kann er als Schlüsseldatei auf einem USB-Stick liegen. Beim Anlegen einen Dateipfad auf dem Stick angeben:
+
+```bash
+python3 webchain.py add-user dave /media/usb/webchain.key
+python3 webchain.py add-admin root /media/usb/admin.key
+```
+
+Auf der Login-Seite (`/account` oder `/admin`) die Datei vom Stick auswählen und „Anmelden“ klicken. Der Server speichert nur den SHA-256-Hash des Tokens. Eine vorhandene Datei wird nie überschrieben. Die Benutzer-Schlüsseldatei enthält zugleich den API-Token.
+
+Wer die Datei kopiert, kann sich damit anmelden. Behandle den Stick wie einen Schlüssel.
+
 ## Kundenseite `/account`
 
 Kunden melden sich mit ihrem API-Token an. Die Seite selbst läuft klassisch über diesen Server, nicht über IPFS. Sie dient nur dazu, Webseiten nach IPFS zu bringen:

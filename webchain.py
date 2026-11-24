@@ -4,8 +4,9 @@
 
 Usage:
   python3 webchain.py serve              start the API server
-  python3 webchain.py add-user <name>    create a user, print its API token
-  python3 webchain.py add-admin <name>   create an admin, print its login token
+  python3 webchain.py add-user <name> [keyfile]    create a user; print its API token, or
+                                                  write it to keyfile (e.g. on a USB stick)
+  python3 webchain.py add-admin <name> [keyfile]   same for an admin login
   python3 webchain.py block <cid>        takedown: deny-list, unpin, fail all requests
 
 Web pages: /account (users: upload a website ZIP, manage pins), /admin (search pins, handle
@@ -404,6 +405,14 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return origin is None or urllib.parse.urlsplit(origin).netloc == self.headers.get("Host")
 
+    def login_token(self):
+        """Token from a key file (e.g. on a USB stick) or from the typed password field."""
+        if self.headers.get_content_type() != "multipart/form-data":
+            return self.form().get("token", "").strip()
+        f = self.upload_fields(limit=MAX_BODY)
+        raw = f.get("keyfile") or f.get("token") or b""
+        return raw.decode("utf-8", "replace").strip()
+
     def session_admin(self, con):
         cookie = self.headers.get("Cookie", "")
         sid = next((c.split("=", 1)[1] for c in cookie.split("; ") if c.startswith("wc_session=")), "")
@@ -420,9 +429,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.report_page(method)
         with db() as con:
             if path == "/admin/login" and method == "POST":
-                f = self.form()
                 row = con.execute("SELECT name FROM admins WHERE token_hash=?",
-                                  (token_hash(f.get("token", "").strip()),)).fetchone()
+                                  (token_hash(self.login_token()),)).fetchone()
                 if not row:
                     return self.send_html(401, "Anmeldung", LOGIN_FORM.format(msg="Falscher Token."))
                 sid = secrets.token_urlsafe(32)
@@ -462,10 +470,10 @@ class Handler(BaseHTTPRequestHandler):
         row = con.execute("SELECT user_id FROM user_sessions WHERE id_hash=?", (token_hash(sid),)).fetchone()
         return row["user_id"] if row else None
 
-    def upload_fields(self):
+    def upload_fields(self, limit=MAX_UPLOAD):
         length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_UPLOAD:
-            raise ApiError(413, "BAD_REQUEST", f"Datei zu groß (max. {MAX_UPLOAD // 2**20} MB).")
+        if length > limit:
+            raise ApiError(413, "BAD_REQUEST", f"Datei zu groß (max. {limit // 2**20 or 1} MB).")
         head = f"Content-Type: {self.headers.get('Content-Type', '')}\r\n\r\n".encode()
         msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(head + self.rfile.read(length))
         if not msg.is_multipart():
@@ -480,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
         with db() as con:
             if path == "/account/login" and method == "POST":
                 row = con.execute("SELECT id FROM users WHERE token_hash=?",
-                                  (token_hash(self.form().get("token", "").strip()),)).fetchone()
+                                  (token_hash(self.login_token()),)).fetchone()
                 if not row:
                     return self.send_html(401, "Anmeldung", USER_LOGIN_FORM.format(msg="Falscher Token."))
                 sid = secrets.token_urlsafe(32)
@@ -584,12 +592,22 @@ def serve():
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
 
-def add_user(name):
-    init_db()
+def issue_token(keyfile):
+    """New random token; written to `keyfile` (e.g. on a USB stick) if given, else printed."""
     token = secrets.token_urlsafe(32)
+    if keyfile:
+        fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never overwrite a key
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+    return token
+
+
+def add_user(name, keyfile=None):
+    init_db()
+    token = issue_token(keyfile)
     with db() as con:
         con.execute("INSERT INTO users (name, token_hash) VALUES (?,?)", (name, token_hash(token)))
-    print(token)
+    print(f"key file written: {keyfile}" if keyfile else token)
 
 
 def block(cid):
@@ -607,12 +625,12 @@ def block(cid):
     return n
 
 
-def add_admin(name):
+def add_admin(name, keyfile=None):
     init_db()
-    token = secrets.token_urlsafe(32)
+    token = issue_token(keyfile)
     with db() as con:
         con.execute("INSERT INTO admins VALUES (?,?)", (token_hash(token), name))
-    print(token)
+    print(f"key file written: {keyfile}" if keyfile else token)
 
 
 _report_hits = {}
@@ -711,9 +729,11 @@ def account_page(con, uid, query):
     return "".join(out)
 
 
-USER_LOGIN_FORM = """<p>{msg}</p><form method="post" action="/account/login">
-<label>API-Token <input type="password" name="token" required autocomplete="current-password"></label>
-<button>Anmelden</button></form>"""
+USER_LOGIN_FORM = """<p>{msg}</p><form method="post" action="/account/login" enctype="multipart/form-data">
+<p><label>Schlüsseldatei vom USB-Stick <input type="file" name="keyfile"></label></p>
+<p>oder</p>
+<p><label>API-Token <input type="password" name="token" autocomplete="current-password"></label></p>
+<p><button>Anmelden</button></p></form>"""
 
 PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} - WebChain</title>
@@ -726,9 +746,11 @@ textarea,input{{max-width:100%;box-sizing:border-box}}
 @media (prefers-color-scheme:dark){{body{{background:#111;color:#eee}}tr.rep{{background:#4a1d1d}}a{{color:#8ab4f8}}}}
 </style></head><body><h1>{title}</h1>{body}</body></html>"""
 
-LOGIN_FORM = """<p>{msg}</p><form method="post" action="/admin/login">
-<label>Admin-Token <input type="password" name="token" required autocomplete="current-password"></label>
-<button>Anmelden</button></form>"""
+LOGIN_FORM = """<p>{msg}</p><form method="post" action="/admin/login" enctype="multipart/form-data">
+<p><label>Schlüsseldatei vom USB-Stick <input type="file" name="keyfile"></label></p>
+<p>oder</p>
+<p><label>Admin-Token <input type="password" name="token" autocomplete="current-password"></label></p>
+<p><button>Anmelden</button></p></form>"""
 
 REPORT_FORM = """<p>{msg}</p><p>Melden Sie hier rechtswidrige Inhalte (Art. 16 DSA).</p>
 <form method="post" action="/report">
@@ -740,9 +762,10 @@ REPORT_FORM = """<p>{msg}</p><p>Melden Sie hier rechtswidrige Inhalte (Art. 16 D
 
 
 if __name__ == "__main__":
-    cmds = {"serve": (serve, 0), "add-user": (add_user, 1), "add-admin": (add_admin, 1),
-            "block": (lambda cid: print(f"blocked {cid}, {block(cid)} pin request(s) failed"), 1)}
-    if len(sys.argv) < 2 or sys.argv[1] not in cmds or len(sys.argv) - 2 != cmds[sys.argv[1]][1]:
+    cmds = {"serve": (serve, 0, 0), "add-user": (add_user, 1, 2), "add-admin": (add_admin, 1, 2),
+            "block": (lambda cid: print(f"blocked {cid}, {block(cid)} pin request(s) failed"), 1, 1)}
+    if (len(sys.argv) < 2 or sys.argv[1] not in cmds
+            or not cmds[sys.argv[1]][1] <= len(sys.argv) - 2 <= cmds[sys.argv[1]][2]):
         sys.exit(__doc__)
-    fn, _ = cmds[sys.argv[1]]
+    fn = cmds[sys.argv[1]][0]
     fn(*sys.argv[2:])
